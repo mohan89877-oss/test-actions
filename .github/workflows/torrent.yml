@@ -31,6 +31,3 @@ jobs:
 
       - name: Download File
         run: torrent download ${{ github.event.inputs.url }}
-
-      - name:
-

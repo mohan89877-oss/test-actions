@@ -1,0 +1,504 @@
+name: Docker Torrent Download
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Torrent file URL'
+        required: true
+      video_filename:
+        description: 'Optional: video filename on torrent (e.g. mymovie.mp4 or mymovie.mkv)'
+      filename:
+        description: 'Optional: rename the discovered video file before upload (e.g. mymovie.mp4 or mymovie.mkv)'
+      on_finished:
+        description: 'Optional: shell command to run after all steps complete (e.g., curl webhook)'
+        required: false
+        default: ''
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    outputs:
+      drive_filepath: ${{ steps.upload_gdrive.outputs.remote_filepath }}
+    container: subekti13/torrent-downloader-v2:ubuntu
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Load Remote ENV from Protected JSON
+        uses: subekti404dev/gha-json-env@v1
+        with:
+          url: ${{ secrets.ENV_URL }}
+          token: ${{ secrets.ENV_TOKEN }}
+
+      - name: Dowload File
+        run: torrent download ${{ github.event.inputs.url }}
+
+      - name: LS
+        run: tree /data
+
+      - name: find video by video_filename
+        if: ${{ github.event.inputs.video_filename && github.event.inputs.video_filename != '' }}
+        id: findvideo
+        run: node scripts/find-video.js "${{ inputs.video_filename }}"
+        env:
+          TARGET: ${{ inputs.video_filename }}
+
+      - name: Show result
+        run: |
+          echo "VIDEO_FILE=${{ steps.findvideo.outputs.video_file }}"
+          echo "VIDEO_FILE=${{ steps.findvideo.outputs.video_file }}" >> "$GITHUB_ENV"
+          
+      - name: Find video file path (largest one)
+        if: ${{ !github.event.inputs.video_filename || github.event.inputs.video_filename == '' }}
+        id: find_video
+        shell: sh
+        run: |
+          set -eu
+          # Extensions to look for
+          exts="mp4 mkv avi mov mpeg mpg m4v webm flv wmv ts m2ts 3gp"
+      
+          # Build the find conditions
+          find_args=""
+          first=1
+          for ext in $exts; do
+            if [ $first -eq 1 ]; then
+              find_args="-iname '*.$ext'"
+              first=0
+            else
+              find_args="$find_args -o -iname '*.$ext'"
+            fi
+          done
+      
+          # Find all matching files, get their size + path, sort by size (largest first)
+          VIDEO_FILE="$(
+            eval "find /data -type f \\( $find_args \\) -print0 2>/dev/null" \
+            | xargs -0 stat -c "%s %n" \
+            | sort -nr \
+            | head -n1 \
+            | cut -d' ' -f2-
+          )"
+      
+          if [ -z "$VIDEO_FILE" ]; then
+            echo "No video files found under /data"
+            exit 1
+          fi
+      
+          echo "Selected VIDEO_FILE: $VIDEO_FILE"
+          echo "VIDEO_FILE=$VIDEO_FILE" >> "$GITHUB_ENV"
+
+      - name: Rename video file (optional)
+        if: ${{ github.event.inputs.filename && github.event.inputs.filename != '' }}
+        id: rename_video
+        shell: sh
+        env:
+          VIDEO_FILE: ${{ env.VIDEO_FILE }}
+        run: |
+          set -eu
+          if [ -z "${VIDEO_FILE:-}" ]; then
+            echo "VIDEO_FILE is not set"
+            exit 1
+          fi
+          echo "VIDEO_FILE is setted"
+
+
+          INPUT_NAME="${{ github.event.inputs.filename }}"
+          if [ -z "${INPUT_NAME:-}" ]; then
+            echo "No filename provided, skipping rename"
+            exit 0
+          fi
+          echo "Filename provided"
+
+          dir="$(dirname "$VIDEO_FILE")"
+          base_input="$(basename "$INPUT_NAME")"
+          echo "Rename context -> dir='$dir', base_input='$base_input'"
+          
+
+
+          # Normalize extension handling:
+          # - Treat names ending with a dot as "no extension" (e.g., "movie.")
+          # - If no extension present, reuse the original file's extension (case preserved)
+          # - If extension present, use as-is
+          orig_ext="${VIDEO_FILE##*.}"
+          echo "Rename context -> orig_ext='$orig_ext'"
+
+          # Detect presence of a non-empty extension in base_input
+          case "$base_input" in
+            *.*)
+              # Has a dot; check if the dot is at the end (empty ext)
+              if [ "${base_input##*.}" = "$base_input" ] || [ -z "${base_input##*.}" ]; then
+                # No real extension after dot -> append original extension
+                new_name="${base_input%.*}.${orig_ext}"
+              else
+                new_name="$base_input"
+              fi
+              ;;
+            *)
+              new_name="$base_input.${orig_ext}"
+              ;;
+          esac
+          echo "Rename context -> new_name='$new_name'"
+
+          
+
+          NEW_PATH="$dir/$new_name"
+          echo "Rename context -> NEW_PATH='$NEW_PATH'"
+
+          echo "Renaming file to: $NEW_PATH"
+          mv -f -- "$VIDEO_FILE" "$NEW_PATH"
+
+          # Update env for subsequent steps
+          echo "VIDEO_FILE=$NEW_PATH" >> "$GITHUB_ENV"
+
+      - name: Check Incomplete Download (contains 'part')
+        id: check_incomplete
+        shell: bash
+        env:
+          VIDEO_FILE: ${{ env.VIDEO_FILE }}
+        run: |
+          set -eu
+          if echo "$VIDEO_FILE" | grep -q "part"; then
+            echo "Detected 'part' in video filename -> mark as failed"
+            echo "IS_FAILED=true" >> "$GITHUB_ENV"
+          else
+            echo "IS_FAILED=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Execute on_finished (failed)
+        if: ${{ env.IS_FAILED == 'true' && github.event.inputs.on_finished != '' }}
+        shell: sh
+        env:
+          IS_FAILED: ${{ env.IS_FAILED }}
+          FILENAME: ${{ github.event.inputs.filename || '' }}
+          TYPE: "gdrive"
+          SOURCE_ID: ""
+        run: |
+          set -eu
+          echo "Executing custom on_finished (failed path):"
+          echo "IS_FAILED: ${IS_FAILED}"
+          echo "${{ github.event.inputs.on_finished }}"
+          eval "${{ github.event.inputs.on_finished }}"
+
+      - name: Upload file to gdrive (composite)
+        id: upload_gdrive
+        if: ${{ env.IS_FAILED != 'true' }}
+        uses: subekti404dev/test-actions/.github/actions/upload-gdrive@main
+        with:
+          env_url: ${{ secrets.ENV_URL }}
+          env_token: ${{ secrets.ENV_TOKEN }}
+          file_path: ${{ env.VIDEO_FILE }}
+  
+
+      - name: Execute on_finished command
+        if: ${{ github.event.inputs.on_finished != '' && env.IS_FAILED != 'true' }}
+        shell: sh
+        env:
+          TYPE: "gdrive"
+          FILENAME: ${{ github.event.inputs.filename || '' }}
+          SOURCE_ID: ${{ steps.upload_gdrive.outputs.file_id }}
+        run: |
+          set -eu
+          echo "Executing custom on_finished command:"
+          echo "${{ github.event.inputs.on_finished }}"
+          eval "${{ github.event.inputs.on_finished }}"
+
+  upload_lixstream:
+    runs-on: ubuntu-latest
+    needs: download
+    container: subekti13/torrent-downloader-v2:ubuntu
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Load Remote ENV from Protected JSON
+        uses: subekti404dev/gha-json-env@v1
+        with:
+          url: ${{ secrets.ENV_URL }}
+          token: ${{ secrets.ENV_TOKEN }}
+      - name: Dwnload file from gdrive (composite)
+        id: dl_gdrive
+        uses: subekti404dev/test-actions/.github/actions/download-gdrive@main
+        with:
+          env_url: ${{ secrets.ENV_URL }}
+          env_token: ${{ secrets.ENV_TOKEN }}
+          remote_filepath: ${{ needs.download.outputs.drive_filepath }}
+
+      - name: Upload file to lixstream (composite)
+        id: upload_lixstream
+        uses: subekti404dev/test-actions/.github/actions/upload-lixstream@main
+        with:
+          env_url: ${{ secrets.ENV_URL }}
+          env_token: ${{ secrets.ENV_TOKEN }}
+          file_path: ${{ steps.dl_gdrive.outputs.local_filepath }}
+
+      - name: Execute on_finished command
+        if: ${{ github.event.inputs.on_finished != '' && steps.upload_lixstream.outputs.file_share_link != '' }}
+        shell: sh
+        env:
+          IS_FAILED: "false"
+          TYPE: "lixstream"
+          FILENAME: ${{ github.event.inputs.filename || '' }}
+          SOURCE_ID: ${{ steps.upload_lixstream.outputs.file_share_link }}
+        run: |
+          set -eu
+          echo "Executing custom on_finished command:"
+          echo "${{ github.event.inputs.on_finished }}"
+          eval "${{ github.event.inputs.on_finished }}"
+
+  upload_vidmoly:
+    if: ${{ false }} # temporarily disabled
+    runs-on: ubuntu-latest
+    needs: download
+    container: subekti13/torrent-downloader-v2:ubuntu
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Load Remote ENV from Protected JSON
+        uses: subekti404dev/gha-json-env@v1
+        with:
+          url: ${{ secrets.ENV_URL }}
+          token: ${{ secrets.ENV_TOKEN }}
+      - name: Dwnload file from gdrive (composite)
+        id: dl_gdrive
+        uses: subekti404dev/test-actions/.github/actions/download-gdrive@main
+        with:
+          env_url: ${{ secrets.ENV_URL }}
+          env_token: ${{ secrets.ENV_TOKEN }}
+          remote_filepath: ${{ needs.download.outputs.drive_filepath }}
+
+      - name: Upload file to vidmoly (composite)
+        id: upload_vidmoly
+        uses: subekti404dev/test-actions/.github/actions/upload-vidmoly@main
+        with:
+          env_url: ${{ secrets.ENV_URL }}
+          env_token: ${{ secrets.ENV_TOKEN }}
+          file_path: ${{ steps.dl_gdrive.outputs.local_filepath }}
+  
+      - name: Execute on_finished command
+        if: ${{ github.event.inputs.on_finished != '' && steps.upload_vidmoly.outputs.file_code != '' }}
+        shell: sh
+        env:
+          IS_FAILED: "false"
+          TYPE: "vidmoly"
+          FILENAME: ${{ github.event.inputs.filename || '' }}
+          SOURCE_ID: ${{ steps.upload_vidmoly.outputs.file_code }}
+        run: |
+          set -eu
+          echo "Executing custom on_finished command:"
+          echo "${{ github.event.inputs.on_finished }}"
+          eval "${{ github.event.inputs.on_finished }}"
+
+  upload_streamtape:
+    runs-on: ubuntu-latest
+    needs: download
+    container: subekti13/torrent-downloader-v2:ubuntu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load Remote ENV from Protected JSON
+        uses: subekti404dev/gha-json-env@v1
+        with:
+          url: ${{ secrets.ENV_URL }}
+          token: ${{ secrets.ENV_TOKEN }}
+
+      - name: Download file from gdrive (composite)
+        id: dl_gdrive
+        uses: subekti404dev/test-actions/.github/actions/download-gdrive@main
+        with:
+          env_url: ${{ secrets.ENV_URL }}
+          env_token: ${{ secrets.ENV_TOKEN }}
+          remote_filepath: ${{ needs.download.outputs.drive_filepath }}
+
+      - name: Upload file to Streamtape (composite)
+        id: upload_streamtape
+        uses: subekti404dev/test-actions/.github/actions/upload-streamtape@main
+        with:
+          env_url: ${{ secrets.ENV_URL }}
+          env_token: ${{ secrets.ENV_TOKEN }}
+          file_path: ${{ steps.dl_gdrive.outputs.local_filepath }}
+
+      - name: Execute on_finished command
+        if: ${{ github.event.inputs.on_finished != '' && steps.upload_streamtape.outputs.id != '' }}
+        shell: sh
+        env:
+          IS_FAILED: "false"
+          TYPE: "streamtape"
+          FILENAME: ${{ github.event.inputs.filename || '' }}
+          SOURCE_ID: ${{ steps.upload_streamtape.outputs.id }}
+        run: |
+          set -eu
+          echo "Executing custom on_finished command:"
+          echo "${{ github.event.inputs.on_finished }}"
+          eval "${{ github.event.inputs.on_finished }}"
+
+  upload_streamplay:
+    if: ${{ false }} # temporarily disabled
+    runs-on: ubuntu-latest
+    needs: download
+    container: subekti13/torrent-downloader-v2:ubuntu
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Load Remote ENV from Protected JSON
+        uses: subekti404dev/gha-json-env@v1
+        with:
+          url: ${{ secrets.ENV_URL }}
+          token: ${{ secrets.ENV_TOKEN }}
+      - name: Dwnload file from gdrive (composite)
+        id: dl_gdrive
+        uses: subekti404dev/test-actions/.github/actions/download-gdrive@main
+        with:
+          env_url: ${{ secrets.ENV_URL }}
+          env_token: ${{ secrets.ENV_TOKEN }}
+          remote_filepath: ${{ needs.download.outputs.drive_filepath }}
+
+      - name: Upload file to streamplay (composite)
+        id: upload_streamplay
+        uses: subekti404dev/test-actions/.github/actions/upload-streamplay@main
+        with:
+          env_url: ${{ secrets.ENV_URL }}
+          env_token: ${{ secrets.ENV_TOKEN }}
+          file_path: ${{ steps.dl_gdrive.outputs.local_filepath }}
+  
+      - name: Execute on_finished command
+        if: ${{ github.event.inputs.on_finished != '' && steps.upload_streamplay.outputs.file_code != '' }}
+        shell: sh
+        env:
+          IS_FAILED: "false"
+          TYPE: "streamplay"
+          FILENAME: ${{ github.event.inputs.filename || '' }}
+          SOURCE_ID: ${{ steps.upload_streamplay.outputs.file_code }}
+        run: |
+          set -eu
+          echo "Executing custom on_finished command:"
+          echo "${{ github.event.inputs.on_finished }}"
+          eval "${{ github.event.inputs.on_finished }}"
+
+  upload_dropload:
+    if: ${{ false }} # temporarily disabled
+    runs-on: ubuntu-latest
+    needs: download
+    container: subekti13/torrent-downloader-v2:ubuntu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load Remote ENV from Protected JSON
+        uses: subekti404dev/gha-json-env@v1
+        with:
+          url: ${{ secrets.ENV_URL }}
+          token: ${{ secrets.ENV_TOKEN }}
+
+      - name: Download file from gdrive (composite)
+        id: dl_gdrive
+        uses: subekti404dev/test-actions/.github/actions/download-gdrive@main
+        with:
+          env_url: ${{ secrets.ENV_URL }}
+          env_token: ${{ secrets.ENV_TOKEN }}
+          remote_filepath: ${{ needs.download.outputs.drive_filepath }}
+
+      - name: Upload file to Dropload (composite)
+        id: upload_dropload
+        uses: subekti404dev/test-actions/.github/actions/upload-dropload@main
+        with:
+          env_url: ${{ secrets.ENV_URL }}
+          env_token: ${{ secrets.ENV_TOKEN }}
+          file_path: ${{ steps.dl_gdrive.outputs.local_filepath }}
+
+      - name: Execute on_finished command
+        if: ${{ github.event.inputs.on_finished != '' && steps.upload_dropload.outputs.file_code != '' }}
+        shell: sh
+        env:
+          IS_FAILED: "false"
+          TYPE: "dropload"
+          FILENAME: ${{ github.event.inputs.filename || '' }}
+          SOURCE_ID: ${{ steps.upload_dropload.outputs.file_code }}
+        run: |
+          set -eu
+          echo "Executing custom on_finished command:"
+          echo "${{ github.event.inputs.on_finished }}"
+          eval "${{ github.event.inputs.on_finished }}"
+
+
+  upload_earnvids:
+    runs-on: ubuntu-latest
+    needs: download
+    container: subekti13/torrent-downloader-v2:ubuntu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load Remote ENV from Protected JSON
+        uses: subekti404dev/gha-json-env@v1
+        with:
+          url: ${{ secrets.ENV_URL }}
+          token: ${{ secrets.ENV_TOKEN }}
+
+      - name: Download file from gdrive (composite)
+        id: dl_gdrive
+        uses: subekti404dev/test-actions/.github/actions/download-gdrive@main
+        with:
+          env_url: ${{ secrets.ENV_URL }}
+          env_token: ${{ secrets.ENV_TOKEN }}
+          remote_filepath: ${{ needs.download.outputs.drive_filepath }}
+
+      - name: Upload file to earnvids (composite)
+        id: upload_earnvids
+        uses: subekti404dev/test-actions/.github/actions/upload-earnvids@main
+        with:
+          env_url: ${{ secrets.ENV_URL }}
+          env_token: ${{ secrets.ENV_TOKEN }}
+          file_path: ${{ steps.dl_gdrive.outputs.local_filepath }}
+
+      - name: Execute on_finished command
+        if: ${{ github.event.inputs.on_finished != '' && steps.upload_earnvids.outputs.file_code != '' }}
+        shell: sh
+        env:
+          IS_FAILED: "false"
+          TYPE: "earnvids"
+          FILENAME: ${{ github.event.inputs.filename || '' }}
+          SOURCE_ID: ${{ steps.upload_earnvids.outputs.file_code }}
+        run: |
+          set -eu
+          echo "Executing custom on_finished command:"
+          echo "${{ github.event.inputs.on_finished }}"
+          eval "${{ github.event.inputs.on_finished }}"
+
+
+  upload_doodstream:
+    runs-on: ubuntu-latest
+    needs: download
+    container: subekti13/torrent-downloader-v2:ubuntu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Load Remote ENV from Protected JSON
+        uses: subekti404dev/gha-json-env@v1
+        with:
+          url: ${{ secrets.ENV_URL }}
+          token: ${{ secrets.ENV_TOKEN }}
+
+      - name: Download file from gdrive (composite)
+        id: dl_gdrive
+        uses: subekti404dev/test-actions/.github/actions/download-gdrive@main
+        with:
+          env_url: ${{ secrets.ENV_URL }}
+          env_token: ${{ secrets.ENV_TOKEN }}
+          remote_filepath: ${{ needs.download.outputs.drive_filepath }}
+
+      - name: Upload file to doodstream (composite)
+        id: upload_doodstream
+        uses: subekti404dev/test-actions/.github/actions/upload-doodstream@main
+        with:
+          env_url: ${{ secrets.ENV_URL }}
+          env_token: ${{ secrets.ENV_TOKEN }}
+          file_path: ${{ steps.dl_gdrive.outputs.local_filepath }}
+
+      - name: Execute on_finished command
+        if: ${{ github.event.inputs.on_finished != '' && steps.upload_doodstream.outputs.file_code != '' }}
+        shell: sh
+        env:
+          IS_FAILED: "false"
+          TYPE: "doodstream"
+          FILENAME: ${{ github.event.inputs.filename || '' }}
+          SOURCE_ID: ${{ steps.upload_doodstream.outputs.file_code }}
+        run: |
+          set -eu
+          echo "Executing custom on_finished command:"
+          echo "${{ github.event.inputs.on_finished }}"
+          eval "${{ github.event.inputs.on_finished }}"
